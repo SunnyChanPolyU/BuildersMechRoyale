@@ -135,7 +135,7 @@ class TerrainMap:
 # -------------------------------------------------------------------- the bot
 
 class Bot:
-    name = "ver-3-bot"
+    name = "ver-4-bot"
 
     PANIC_DIST = 100.0   # flee if a mech is visible closer than this
     FIGHT_DIST = 60.0    # engage when pressed closer than this
@@ -151,13 +151,19 @@ class Bot:
         self.rear_bearing_age = 0
         self.cover_goal = None
         self.next_cover_scan = 0
+        self.tracked_mechs = {}
+        self.last_damage_tick = -1000
+        self.last_hit_tick = -1000
+        self.previous_hp = None
+        self.last_state = "explore"
+        self.match_seed = int(hello.get("seed", 0))
         self.map = None
         try:
             self.map = TerrainMap(hello["map"]["dir"],
                                   hello["map"].get("files", []))
-            mf.log(f"ver-2-bot: map loaded, {len(self.map.prisms)} prisms")
+            mf.log(f"ver-4-bot: map loaded, {len(self.map.prisms)} prisms")
         except Exception as e:  # any failure: degrade, never crash
-            mf.log(f"ver-2-bot: no map ({e!r}); fallback flee mode")
+            mf.log(f"ver-4-bot: no map ({e!r}); fallback navigation mode")
         self.cover_goal = None
         self.next_cover_scan = 0
 
@@ -260,11 +266,19 @@ class Bot:
                 if cid == "armor" and hp_frac < 0.6:
                     score += 35.0
             if "sensor" in cid or "sensor" in text:
-                score += 20.0
+                score += 28.0
             if any(s in cid for s in ("speed", "boost", "mobility", "walk")) or "speed" in text:
                 score += 24.0
             if any(s in cid for s in ("damage", "ammo", "fire", "rate", "reload")) or any(s in text for s in ("damage", "fire rate", "reload")):
                 score += 42.0
+            if cid.startswith("gun_") or cid.startswith("mortar_") or cid.startswith("laser_") or cid.startswith("lightning_"):
+                kind = cid.split("_", 1)[0]
+                if kind not in held:
+                    score -= 55.0
+                else:
+                    score += 38.0
+            if any(s in cid for s in ("cube", "size")):
+                score += 12.0
             if "cube" in cid or "cube" in text:
                 score += 20.0 + 4.0 * me["cubes"]
             for kind in ("gun", "mortar", "laser", "lightning"):
@@ -354,12 +368,7 @@ class Bot:
                 min_charge = float(self.cfg.get("weapons", {}).get("laser", {}).get("min_charge", 0.15))
                 charge = float(weapon.get("charge", 0))
                 if not blocked and cooldown <= 0.05 and d <= float(stats.get("range", 280)):
-                    if charge == 0:
-                        fire[i] = True
-                    elif charge >= charge_full or (charge >= min_charge and d < 90):
-                        fire[i] = False
-                    else:
-                        fire[i] = True
+                    fire[i] = not (charge >= charge_full or (charge >= min_charge and d < 90))
                 aim = aim or self._led_aim(me, target, weapon)
             elif kind == "lightning":
                 energy_cost = float(self.cfg.get("weapons", {}).get("lightning", {}).get("energy", 3))
@@ -368,6 +377,110 @@ class Bot:
                     fire[i] = True
                 aim = aim or self._led_aim(me, target, weapon)
         return aim, fire, reload
+
+    def _update_tracking(self, obs):
+        tick = int(obs["tick"])
+        memory_s = float(self.cfg.get("vision", {}).get("memory_s", 5.0))
+        for actor in obs["mechs"]:
+            if actor["kind"] != "mech":
+                continue
+            self.tracked_mechs[actor["id"]] = {
+                "pos": list(actor["pos"]),
+                "vel": list(actor.get("vel", [0.0, 0.0, 0.0])),
+                "aim": list(actor.get("aim", [0.0, 0.0])),
+                "hp": float(actor.get("hp", 1400)),
+                "weapons": list(actor.get("weapons", [])),
+                "charging": bool(actor.get("charging", False)),
+                "seen": tick,
+            }
+        cutoff = tick - int(memory_s * 20)
+        self.tracked_mechs = {
+            actor_id: target for actor_id, target in self.tracked_mechs.items()
+            if target["seen"] >= cutoff
+        }
+
+    def _select_target(self, me, obs):
+        x, y, z = me["pos"]
+        hp_frac = me["hp"] / me["max_hp"]
+        best = None
+        best_score = float("-inf")
+        for actor_id, target in self.tracked_mechs.items():
+            tx, ty, tz = target["pos"]
+            d = math.hypot(tx - x, ty - y)
+            if d > 1000:
+                continue
+            target_hp = target["hp"] / 1400.0
+            score = 90.0 - d * 0.45
+            score += max(0.0, 0.8 - target_hp) * 55.0
+            score -= hp_frac * 8.0
+            if target["charging"]:
+                score -= 25.0
+                score += 18.0 if d < 70 else -10.0
+            if "lightning" in target["weapons"]:
+                score -= 8.0 if d < 45 else 5.0
+            if "mortar" in target["weapons"]:
+                score += 12.0 if d > 60 else -12.0
+            if "laser" in target["weapons"]:
+                score += 8.0 if d > 70 else -8.0
+            if target["seen"] == int(obs["tick"]):
+                score += 15.0
+            if d < 12:
+                score -= 18.0
+            if d > 220:
+                score -= (d - 220) * 0.12
+            if score > best_score:
+                best_score = score
+                best = {
+                    "pos": list(target["pos"]),
+                    "vel": list(target["vel"]),
+                    "weapons": list(target["weapons"]),
+                    "charging": target["charging"],
+                    "hp": target["hp"],
+                    "id": actor_id,
+                }
+        return best
+
+    def _best_movement_direction(self, me, target, nxt, nr, obs):
+        x, y, z = me["pos"]
+        if target is None:
+            return None
+        tx, ty, _ = target["pos"]
+        d = math.hypot(tx - x, ty - y) or 1.0
+        toward = [(tx - x) / d, (ty - y) / d]
+        away = [-toward[0], -toward[1]]
+        weapons = set(me["weapons"][i]["kind"] for i in range(len(me["weapons"])) if me["weapons"][i])
+        ideal = 35.0
+        if "lightning" in weapons:
+            ideal = 32.0
+        elif "laser" in weapons:
+            ideal = 95.0
+        elif "mortar" in weapons:
+            ideal = 120.0
+        elif "gun" in weapons:
+            ideal = 70.0
+
+        target_weapons = set(target.get("weapons", []))
+        hp_frac = me["hp"] / me["max_hp"]
+        if hp_frac < 0.35 or (target.get("charging") and d < 140):
+            vx, vy = away
+        elif d < ideal * 0.55:
+            vx, vy = away
+        elif d > ideal * 1.35:
+            vx, vy = toward
+        else:
+            vx, vy = -toward[1], toward[0]
+            if int(obs["tick"] / 20) % 2:
+                vx, vy = vy, vx
+                vx, vy = -vx, -vy
+
+        if "mortar" in target_weapons and d < 65:
+            vx, vy = away
+        if not me["in_zone"]:
+            zx, zy = nxt
+            vx, vy = zx - x, zy - y
+
+        n = math.hypot(vx, vy) or 1.0
+        return [vx / n, vy / n]
 
     # ---- one decision -----------------------------------------------------
 
@@ -381,105 +494,112 @@ class Bot:
         if pick is not None:
             act["pick"] = pick
 
+        if self.previous_hp is not None and me["hp"] < self.previous_hp:
+            self.last_damage_tick = int(obs["tick"])
+        for event in reversed(obs.get("events", [])):
+            if event.get("type") == "hit":
+                self.last_hit_tick = int(obs["tick"])
+                break
+        self.previous_hp = me["hp"]
+        self._update_tracking(obs)
+
         zone = obs["zone"]
         zc = zone["center"]
         nxt, nr = zone["next_center"], zone["next_radius"]
         tgt = self._safe_point(x, y, nxt, nr)
 
-        threats = sorted(
-            ((math.dist(m["pos"], me["pos"]), m)
-             for m in obs["mechs"]),
-            key=lambda t: t[0])
-        near = [(d, m) for d, m in threats if d < self.PANIC_DIST]
-
-        hostile_sounds = [
-            sound for sound in obs.get("sounds", [])
-            if sound.get("kind") in ("gun", "mortar", "explosion", "laser",
-                                     "laser_charge", "lightning", "npc_gun")
-            and sound.get("bearing") is not None
-        ]
+        target = self._select_target(me, obs)
+        threats = []
+        for tracked in self.tracked_mechs.values():
+            d = math.hypot(tracked["pos"][0] - x, tracked["pos"][1] - y)
+            if d < self.PANIC_DIST:
+                threats.append((d, tracked))
 
         flee_yaw = None
-        for e in reversed(obs["events"]):
-            if e.get("type") == "damaged" and e.get("weapon") != "zone":
-                if e.get("bearing") is not None:
-                    flee_yaw = e["bearing"] + math.pi
-                    if e.get("rear"):
-                        self.rear_bearing = e["bearing"]
+        for event in reversed(obs["events"]):
+            if event.get("type") == "damaged" and event.get("weapon") != "zone":
+                if event.get("bearing") is not None:
+                    flee_yaw = event["bearing"] + math.pi
+                    if event.get("rear"):
+                        self.rear_bearing = event["bearing"]
                         self.rear_bearing_age = obs["tick"]
                 break
-        if not flee_yaw and hostile_sounds:
-            flee_yaw = hostile_sounds[-1]["bearing"] + math.pi
         if self.rear_bearing is not None and obs["tick"] - self.rear_bearing_age > 40:
             self.rear_bearing = None
 
-        fleeing = bool(near) or flee_yaw is not None
-
-        if fleeing:
-            goal = self.cover_goal
-            replan = (goal is None or obs["tick"] >= self.next_cover_scan
-                      or math.hypot(goal[0] - x, goal[1] - y) < 8.0)
-            if near and replan:
-                self.cover_goal = self._find_cover(x, y, z, near[0][1], nxt, nr)
-                self.next_cover_scan = obs["tick"] + self.COVER_CHECK
-            goal = self.cover_goal or tgt
-
-            # blended flee vector: toward goal, away from threat, away from hits
-            vx, vy = 0.0, 0.0
-            dg = math.hypot(goal[0] - x, goal[1] - y) or 1.0
-            vx += (goal[0] - x) / dg
-            vy += (goal[1] - y) / dg
-            if near:
-                d, m = near[0]
-                t_yaw = math.atan2(m["pos"][1] - y, m["pos"][0] - x)
-                w = 0.7 * (self.PANIC_DIST - min(d, self.PANIC_DIST)) / self.PANIC_DIST
-                vx -= math.cos(t_yaw) * w
-                vy -= math.sin(t_yaw) * w
-            if flee_yaw is not None:
-                vx += math.cos(flee_yaw) * 0.5
-                vy += math.sin(flee_yaw) * 0.5
-            n = math.hypot(vx, vy) or 1.0
-            act["move"] = [vx / n, vy / n]
-            energy = float(me["energy"])
-            boost_drain = float(self.cfg.get("mech", {}).get("boost_drain", 8.0))
-            act["boost"] = (me["grounded"] and energy > max(18.0, boost_drain * 2.0)) \
-                           or (not me["grounded"] and energy > 12.0)
-
-            if near:
-                d, m = near[0]
-                aim, fire, reload = self._combat_fire(me, m)
-                if self.rear_bearing is not None:
-                    act["aim"] = [self.rear_bearing, 0.0]
-                elif aim:
-                    act["aim"] = aim
-                act["fire"] = fire
-                if reload:
-                    act["reload"] = True
-                act["jump"] = bool(me["grounded"] and energy > 35.0
-                                   and obs["tick"] % 30 == 0)
+        state = "zone"
+        if not me["in_zone"]:
+            state = "out_of_zone"
+        elif target is not None:
+            target_dist = math.hypot(target["pos"][0] - x, target["pos"][1] - y)
+            if hp_frac < 0.32 or target_dist < 18:
+                state = "disengage"
             else:
-                if self.rear_bearing is not None:
-                    act["aim"] = [self.rear_bearing, 0.0]
-                else:
-                    act["aim"] = [me["aim"][0], 0.0]
+                state = "engage"
+        elif obs["cubes"]:
+            state = "collect"
+        self.last_state = state
+
+        if state == "out_of_zone":
+            dx, dy = zc[0] - x, zc[1] - y
+            dl = math.hypot(dx, dy) or 1.0
+            act["move"] = [dx / dl, dy / dl]
+            act["aim"] = [math.atan2(dy, dx), 0.0]
+            act["boost"] = bool(me["energy"] > 12)
+        elif state in ("engage", "disengage"):
+            direction = self._best_movement_direction(me, target, tgt, nr, obs)
+            act["move"] = direction or [0.0, 0.0]
+            aim, fire, reload = self._combat_fire(me, target)
+            if aim:
+                act["aim"] = aim
+            elif flee_yaw is not None:
+                act["aim"] = [flee_yaw, 0.0]
+            act["fire"] = fire
+            if reload:
+                act["reload"] = True
+            energy = float(me["energy"])
+            act["boost"] = bool(me["grounded"] and energy > 25
+                                and state == "disengage")
+            if state == "disengage" and target:
+                target_pos = target["pos"]
+                replan = (self.cover_goal is None
+                          or obs["tick"] >= self.next_cover_scan
+                          or math.hypot(self.cover_goal[0] - x,
+                                        self.cover_goal[1] - y) < 8)
+                if replan:
+                    threat = {"pos": target_pos}
+                    self.cover_goal = self._find_cover(x, y, z, threat, nxt, nr)
+                    self.next_cover_scan = obs["tick"] + self.COVER_CHECK
+                if self.cover_goal:
+                    dx, dy = self.cover_goal[0] - x, self.cover_goal[1] - y
+                    dl = math.hypot(dx, dy) or 1.0
+                    act["move"] = [dx / dl, dy / dl]
+            if me["grounded"] and energy > 35:
+                act["jump"] = bool(obs["tick"] % 30 == 0 and target
+                                   and math.hypot(target["pos"][0] - x,
+                                                  target["pos"][1] - y) < 55)
         else:
             self.cover_goal = None
             dx, dy = tgt[0] - x, tgt[1] - y
             dl = math.hypot(dx, dy) or 1.0
             act["move"] = [dx / dl, dy / dl]
             act["aim"] = [math.atan2(dy, dx), 0.0]
-            act["boost"] = False
             silent = self._silent_factor(me)
             act["move"][0] *= silent
             act["move"][1] *= silent
-            cb = min(obs["cubes"],
-                     key=lambda c: math.dist(c["pos"], me["pos"]),
-                     default=None)
-            if cb and math.dist(cb["pos"], me["pos"]) < self.CUBE_GRAB:
-                vx, vy = cb["pos"][0] - x, cb["pos"][1] - y
-                n = math.hypot(vx, vy) or 1.0
-                act["move"] = [vx / n * silent, vy / n * silent]
-                act["aim"] = [math.atan2(vy, vx), 0.0]
+            act["boost"] = False
+            if state == "collect":
+                cb = min(obs["cubes"],
+                         key=lambda c: (
+                             math.dist(c["pos"], me["pos"])
+                             + (0 if math.dist(c["pos"], me["pos"]) < self.CUBE_GRAB else 20)
+                         ),
+                         default=None)
+                if cb:
+                    vx, vy = cb["pos"][0] - x, cb["pos"][1] - y
+                    d = math.hypot(vx, vy) or 1.0
+                    act["move"] = [vx / d * silent, vy / d * silent]
+                    act["aim"] = [math.atan2(vy, vx), 0.0]
 
         take = self._take_weapon(me, obs)
         if take:
@@ -511,12 +631,13 @@ class Bot:
             act["boost"] = bool(me["energy"] > 12)
             act["aim"] = [math.atan2(dy, dx), 0.0]
 
-        mode = "cover" if (fleeing and near) else ("flee" if fleeing else "hide")
-        mf.draw.label(f"{me['hp']:.0f}hp {len(near)}T {mode}{' map-ok' if self.map else ''}")
+        mf.draw.label(
+            f"{me['hp']:.0f}hp {len(threats)}T {state}{' map-ok' if self.map else ''}"
+        )
         if self.cover_goal:
             mf.draw.point([self.cover_goal[0], self.cover_goal[1], z], "#40c0ff", 6)
-        if near:
-            mf.draw.line([x, y, z + 7], near[0][1]["pos"], "#ff5040")
+        if target:
+            mf.draw.line([x, y, z + 7], target["pos"], "#ff5040")
         return act
 
 
