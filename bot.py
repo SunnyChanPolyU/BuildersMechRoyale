@@ -154,6 +154,8 @@ class Bot:
         self.cover_goal = None
         self.next_cover_scan = 0
         self.tracked_mechs = {}
+        self.target_lock_id = None
+        self.target_lock_until = -1
         self.last_damage_tick = -1000
         self.last_hit_tick = -1000
         self.previous_hp = None
@@ -185,11 +187,14 @@ class Bot:
         return (nxt[0] - (dx / d) * r, nxt[1] - (dy / d) * r)
 
     def _find_cover(self, x, y, z, threat, nxt, nr):
-        """Nearest spot where a building blocks LOS from `threat`, still
+        """Nearest spot that blocks LOS from several nearby threats, still
         inside the next circle. Returns (x, y) or None."""
         if self.map is None:
             return None
-        tx, ty, tz = threat["pos"]
+        if "threats" in threat:
+            threat_positions = [item["pos"] for item in threat["threats"]]
+        else:
+            threat_positions = [threat["pos"]]
         b = self.map.bounds
         best, best_cost = None, float("inf")
         for i in range(24):
@@ -208,10 +213,17 @@ class Bot:
                         float(mech_cfg.get("max_slope_deg", 50.0))):
                     continue
                 cz = self.map.ground(cx, cy) + self.eye
-                if not self.map.blocked(tx, ty, tz + self.eye, cx, cy, cz):
+                blocked_from = 0
+                threat_distance = 0.0
+                for tx, ty, tz in threat_positions:
+                    threat_distance += math.hypot(cx - tx, cy - ty)
+                    if self.map.blocked(tx, ty, tz + self.eye, cx, cy, cz):
+                        blocked_from += 1
+                if blocked_from * 2 < len(threat_positions):
                     continue
                 cost = (math.hypot(cx - x, cy - y) * 0.6
-                        + math.hypot(cx - tx, cy - ty) * 0.4)
+                        + (threat_distance / len(threat_positions)) * 0.4
+                        - blocked_from * 8.0)
                 if cost < best_cost:
                     best, best_cost = (cx, cy), cost
         return best
@@ -502,6 +514,19 @@ class Bot:
     def _select_target(self, me, obs):
         x, y, z = me["pos"]
         hp_frac = me["hp"] / me["max_hp"]
+        tick = int(obs["tick"])
+        memory_s = float(self.cfg.get("vision", {}).get("memory_s", 5.0))
+
+        locked = self.tracked_mechs.get(self.target_lock_id)
+        if locked is not None:
+            lx, ly, _ = locked["pos"]
+            ld = math.hypot(lx - x, ly - y)
+            if (locked["hp"] <= 0 or ld > 220
+                    or tick - int(locked["seen"]) > int(memory_s * 20)
+                    or tick >= self.target_lock_until):
+                locked = None
+                self.target_lock_id = None
+
         best = None
         best_score = float("-inf")
         for actor_id, target in self.tracked_mechs.items():
@@ -518,6 +543,8 @@ class Bot:
             score = 90.0 - d * 0.35
             score += max(0.0, 0.8 - target_hp) * 140.0
             score += 80.0 if visible else -70.0
+            if actor_id == self.target_lock_id:
+                score += 40.0
             score -= hp_frac * 8.0
             if target["charging"]:
                 score -= 25.0
@@ -544,6 +571,9 @@ class Bot:
                     "hp": target["hp"],
                     "id": actor_id,
                 }
+        if best is not None:
+            self.target_lock_id = best["id"]
+            self.target_lock_until = tick + 160
         return best
 
     def _best_movement_direction(self, me, target, nxt, nr, obs):
@@ -634,6 +664,11 @@ class Bot:
             self.rear_bearing = None
 
         state = "zone"
+        blocked_shot = bool(target and self.map is not None
+                            and self.map.blocked(
+                                x, y, z + float(me["stats"].get("eye_height", self.eye)),
+                                target["pos"][0], target["pos"][1],
+                                target["pos"][2] + 4.5))
         if not me["in_zone"]:
             state = "out_of_zone"
         elif target is not None:
@@ -664,11 +699,6 @@ class Bot:
             if reload:
                 act["reload"] = True
 
-            blocked_shot = bool(target and self.map is not None
-                                and self.map.blocked(
-                                    x, y, z + float(me["stats"].get("eye_height", self.eye)),
-                                    target["pos"][0], target["pos"][1],
-                                    target["pos"][2] + 4.5))
             if blocked_shot:
                 if getattr(self, "_los_goal", None) is None \
                         or getattr(self, "_los_goal_target", None) != target.get("id") \
@@ -710,7 +740,15 @@ class Bot:
                           or math.hypot(self.cover_goal[0] - x,
                                         self.cover_goal[1] - y) < 8)
                 if replan:
-                    threat = {"pos": target_pos}
+                    threat = {
+                        "threats": [
+                            tracked for tracked in self.tracked_mechs.values()
+                            if math.hypot(tracked["pos"][0] - x,
+                                          tracked["pos"][1] - y) < self.PANIC_DIST
+                        ]
+                    }
+                    if not threat["threats"]:
+                        threat = {"pos": target_pos}
                     self.cover_goal = self._find_cover(x, y, z, threat, nxt, nr)
                     self.next_cover_scan = obs["tick"] + self.COVER_CHECK
                 if self.cover_goal:
