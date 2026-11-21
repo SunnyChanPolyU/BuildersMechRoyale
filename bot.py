@@ -135,13 +135,15 @@ class TerrainMap:
 # -------------------------------------------------------------------- the bot
 
 class Bot:
-    name = "ver-4-bot"
+    name = "ver-5-bot"
 
     PANIC_DIST = 100.0   # flee if a mech is visible closer than this
     FIGHT_DIST = 60.0    # engage when pressed closer than this
     CUBE_GRAB = 25.0     # grab cubes within this range while calm
     ZONE_MARGIN = 40.0   # preferred inset from the next circle's edge
     COVER_CHECK = 40     # re-plan cover every N ticks (~2 s)
+    POPULATION_RADIUS = 100.0
+    DRIFT_RADIUS = 55.0
 
     def __init__(self, hello: mf.Hello):
         cfg = hello["config"]
@@ -217,6 +219,62 @@ class Bot:
         if walk <= step:
             return 0.95
         return max(0.05, min(0.9, (step * 0.9) / walk))
+
+    def _least_populated_point(self, me, nxt, nr):
+        """Choose a reachable calm-state destination with the fewest known mechs nearby."""
+        x, y, z = me["pos"]
+        candidates = []
+
+        for i in range(24):
+            angle = i * (2 * math.pi / 24)
+            for radius in (self.DRIFT_RADIUS, self.DRIFT_RADIUS * 1.75):
+                cx = x + radius * math.cos(angle)
+                cy = y + radius * math.sin(angle)
+                if math.hypot(cx - nxt[0], cy - nxt[1]) <= nr - 10.0:
+                    candidates.append((cx, cy))
+
+        if self.map is not None:
+            b = self.map.bounds
+            step = 50.0
+            cx = b["minX"]
+            while cx < b["maxX"]:
+                cy = b["minY"]
+                while cy < b["maxY"]:
+                    if math.hypot(cx - nxt[0], cy - nxt[1]) <= nr - 10.0:
+                        candidates.append((cx, cy))
+                    cy += step
+                cx += step
+
+        if not candidates:
+            return (nxt[0], nxt[1])
+
+        mech_cfg = self.cfg.get("mech", {})
+        best = None
+        best_score = float("inf")
+        for cx, cy in candidates:
+            if self.map is not None:
+                if not self.map.reachable(
+                        cx, cy, z,
+                        float(mech_cfg.get("max_step", 1.2)),
+                        float(mech_cfg.get("max_slope_deg", 50.0))):
+                    continue
+
+            nearby = 0
+            proximity = 0.0
+            for tracked in self.tracked_mechs.values():
+                tx, ty = tracked["pos"][0], tracked["pos"][1]
+                d = math.hypot(cx - tx, cy - ty)
+                if d < self.POPULATION_RADIUS:
+                    nearby += 1
+                    proximity += (self.POPULATION_RADIUS - d) / self.POPULATION_RADIUS
+
+            travel = math.hypot(cx - x, cy - y)
+            score = nearby * 100.0 + proximity * 20.0 + travel * 0.08
+            if score < best_score:
+                best_score = score
+                best = (cx, cy)
+
+        return best or (nxt[0], nxt[1])
 
     def _led_aim(self, me, target, weapon=None):
         tx, ty, tz = target["pos"]
@@ -580,7 +638,8 @@ class Bot:
                                                   target["pos"][1] - y) < 55)
         else:
             self.cover_goal = None
-            dx, dy = tgt[0] - x, tgt[1] - y
+            drift = self._least_populated_point(me, nxt, nr)
+            dx, dy = drift[0] - x, drift[1] - y
             dl = math.hypot(dx, dy) or 1.0
             act["move"] = [dx / dl, dy / dl]
             act["aim"] = [math.atan2(dy, dx), 0.0]
