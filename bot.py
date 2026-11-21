@@ -158,6 +158,9 @@ class Bot:
         self.last_hit_tick = -1000
         self.previous_hp = None
         self.last_state = "explore"
+        self._los_goal = None
+        self._los_goal_target = None
+        self._los_goal_scan = 0
         self.match_seed = int(hello.get("seed", 0))
         self.map = None
         try:
@@ -211,6 +214,45 @@ class Bot:
                         + math.hypot(cx - tx, cy - ty) * 0.4)
                 if cost < best_cost:
                     best, best_cost = (cx, cy), cost
+        return best
+
+    def _find_los_goal(self, me, target, nxt, nr):
+        """Find a reachable gun position with a clear shot when the target
+        is being tracked but terrain currently blocks the line of fire."""
+        if self.map is None or target is None:
+            return None
+
+        x, y, z = me["pos"]
+        tx, ty, tz = target["pos"]
+        eye_z = z + float(me["stats"].get("eye_height", self.eye))
+        target_z = tz + 4.5
+        mech_cfg = self.cfg.get("mech", {})
+        best = None
+        best_score = float("inf")
+
+        for r in (45.0, 60.0, 75.0, 95.0, 120.0):
+            for i in range(24):
+                ang = i * (2.0 * math.pi / 24.0)
+                cx = tx + r * math.cos(ang)
+                cy = ty + r * math.sin(ang)
+                if math.hypot(cx - nxt[0], cy - nxt[1]) > nr - 12.0:
+                    continue
+                if math.hypot(cx - x, cy - y) < 12.0:
+                    continue
+                if not self.map.reachable(
+                        cx, cy, z,
+                        float(mech_cfg.get("max_step", 1.2)),
+                        float(mech_cfg.get("max_slope_deg", 50.0))):
+                    continue
+                cz = self.map.ground(cx, cy) + float(me["stats"].get("eye_height", self.eye))
+                if self.map.blocked(cx, cy, cz, tx, ty, target_z):
+                    continue
+                shot_d = math.hypot(cx - tx, cy - ty)
+                travel = math.hypot(cx - x, cy - y)
+                score = travel * 0.8 + abs(shot_d - 70.0) * 0.35
+                if score < best_score:
+                    best_score = score
+                    best = (cx, cy)
         return best
 
     def _silent_factor(self, me):
@@ -283,7 +325,7 @@ class Bot:
         dx, dy = tx - x, ty - y
         d = math.hypot(dx, dy)
         speed = float(weapon.get("stats", {}).get("speed", 0.0)) if weapon else 0.0
-        if speed > 0:
+        if speed > 0 and weapon and weapon["kind"] != "gun":
             flight = d / speed
             px, py, pz = tx + tvx * flight, ty + tvy * flight, tz + tvz * flight
         else:
@@ -467,9 +509,15 @@ class Bot:
             d = math.hypot(tx - x, ty - y)
             if d > 1000:
                 continue
+            visible = True
+            if self.map is not None:
+                visible = not self.map.blocked(
+                    x, y, z + float(me["stats"].get("eye_height", self.eye)),
+                    tx, ty, tz + 4.5)
             target_hp = target["hp"] / 1400.0
-            score = 90.0 - d * 0.45
-            score += max(0.0, 0.8 - target_hp) * 55.0
+            score = 90.0 - d * 0.35
+            score += max(0.0, 0.8 - target_hp) * 140.0
+            score += 80.0 if visible else -70.0
             score -= hp_frac * 8.0
             if target["charging"]:
                 score -= 25.0
@@ -590,7 +638,7 @@ class Bot:
             state = "out_of_zone"
         elif target is not None:
             target_dist = math.hypot(target["pos"][0] - x, target["pos"][1] - y)
-            if hp_frac < 0.32 or target_dist < 18:
+            if hp_frac < 0.55 or target_dist < 18:
                 state = "disengage"
             else:
                 state = "engage"
@@ -615,6 +663,43 @@ class Bot:
             act["fire"] = fire
             if reload:
                 act["reload"] = True
+
+            blocked_shot = bool(target and self.map is not None
+                                and self.map.blocked(
+                                    x, y, z + float(me["stats"].get("eye_height", self.eye)),
+                                    target["pos"][0], target["pos"][1],
+                                    target["pos"][2] + 4.5))
+            if blocked_shot:
+                if getattr(self, "_los_goal", None) is None \
+                        or getattr(self, "_los_goal_target", None) != target.get("id") \
+                        or obs["tick"] >= getattr(self, "_los_goal_scan", 0):
+                    los_goal = self._find_los_goal(me, target, nxt, nr)
+                    self._los_goal = los_goal
+                    self._los_goal_target = target.get("id")
+                    self._los_goal_scan = obs["tick"] + 20
+                if self._los_goal:
+                    dx, dy = self._los_goal[0] - x, self._los_goal[1] - y
+                    dl = math.hypot(dx, dy) or 1.0
+                    act["move"] = [dx / dl, dy / dl]
+                    act["boost"] = bool(me["grounded"] and me["energy"] > 20)
+            else:
+                self._los_goal = None
+                self._los_goal_target = None
+
+            if target and not blocked_shot:
+                td = math.hypot(target["pos"][0] - x, target["pos"][1] - y)
+                held_gun = any(
+                    weapon and weapon["kind"] == "gun"
+                    for weapon in me["weapons"][:2]
+                )
+                if held_gun and 45.0 <= td <= 110.0 and hp_frac > 0.55:
+                    pdx, pdy = target["pos"][0] - x, target["pos"][1] - y
+                    pm = math.hypot(pdx, pdy) or 1.0
+                    strafe_yaw = int(obs["tick"] / 30) % 2
+                    sx, sy = -pdy / pm, pdx / pm
+                    if strafe_yaw:
+                        sx, sy = -sx, -sy
+                    act["move"] = [sx * 0.35, sy * 0.35]
             energy = float(me["energy"])
             act["boost"] = bool(me["grounded"] and energy > 25
                                 and state == "disengage")
@@ -700,4 +785,5 @@ class Bot:
         return act
 
 
-mf.run(Bot)
+if __name__ == "__main__":
+    mf.run(Bot)
