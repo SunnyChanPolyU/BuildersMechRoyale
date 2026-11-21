@@ -6,7 +6,6 @@ from actions import combat_fire, led_aim, take_weapon
 from decisions import (
     choose_state,
     find_cover,
-    least_populated_point,
     movement_direction,
     pick_upgrade,
     safe_point,
@@ -18,7 +17,7 @@ from map import TerrainMap
 
 
 class Bot:
-    name = "ver-5-bot"
+    name = "ver-4-bot"
 
     PANIC_DIST = 100.0
     FIGHT_DIST = 60.0
@@ -69,34 +68,6 @@ class Bot:
 
     def _silent_factor(self, me):
         return silent_factor(me, self.cfg)
-
-    def _least_populated_point(self, me, obs, next_center, next_radius):
-        known = []
-        seen_ids = set()
-        for actor in obs.get("mechs", []):
-            actor_id = actor.get("id")
-            if actor.get("kind") == "mech" and actor_id == me["id"]:
-                continue
-            pos = actor.get("pos")
-            if pos:
-                known.append(list(pos[:2]))
-                seen_ids.add(actor_id)
-        for actor_id, tracked in self.tracked_mechs.items():
-            if actor_id in seen_ids:
-                continue
-            pos = tracked.get("pos")
-            if pos:
-                known.append(list(pos[:2]))
-        x, y = me["pos"][:2]
-        return least_populated_point(
-            x,
-            y,
-            next_center,
-            next_radius,
-            known,
-            self.map,
-            self.cfg,
-        )
 
     def _led_aim(self, me, target, weapon=None):
         return led_aim(me, target, self.cfg, self.eye, weapon)
@@ -170,7 +141,7 @@ class Bot:
         if self.rear_bearing is not None and obs["tick"] - self.rear_bearing_age > 40:
             self.rear_bearing = None
 
-        state = choose_state(me, obs, target, len(threats))
+        state = choose_state(me, obs, target)
         self.last_state = state
 
         if state == "out_of_zone":
@@ -193,10 +164,7 @@ class Bot:
                 action["aim"] = aim
             elif flee_yaw is not None:
                 action["aim"] = [flee_yaw, 0.0]
-            if state == "disengage":
-                action["fire"] = [False, False]
-            else:
-                action["fire"] = fire
+            action["fire"] = fire
             if reload:
                 action["reload"] = True
 
@@ -231,26 +199,7 @@ class Bot:
                     length = math.hypot(dx, dy) or 1.0
                     action["move"] = [dx / length, dy / length]
 
-            incoming = None
-            incoming_distance = float("inf")
-            for projectile in obs.get("projectiles", []):
-                px, py, pz = projectile["pos"]
-                rx, ry = px - x, py - y
-                distance = math.hypot(rx, ry)
-                if distance < 28.0 and distance < incoming_distance:
-                    incoming_distance = distance
-                    incoming = projectile
-            if incoming is not None:
-                px, py, _ = incoming["pos"]
-                dx, dy = x - px, y - py
-                length = math.hypot(dx, dy) or 1.0
-                action["move"] = [dx / length, dy / length]
-                if state == "disengage":
-                    action["boost"] = bool(
-                        me["grounded"] and float(me["energy"]) > 25
-                    )
-
-            if state == "engage" and me["grounded"] and energy > 35:
+            if me["grounded"] and energy > 35:
                 target_distance = (
                     math.hypot(target["pos"][0] - x, target["pos"][1] - y)
                     if target
@@ -263,15 +212,6 @@ class Bot:
                 )
         else:
             self.cover_goal = None
-            if state == "zone":
-                sparse_point = self._least_populated_point(
-                    me,
-                    obs,
-                    next_center,
-                    next_radius,
-                )
-                if sparse_point:
-                    target_point = sparse_point
             dx, dy = target_point[0] - x, target_point[1] - y
             length = math.hypot(dx, dy) or 1.0
             action["move"] = [dx / length, dy / length]
@@ -281,16 +221,8 @@ class Bot:
             action["move"][1] *= silent
             action["boost"] = False
             if state == "collect":
-                safe_radius = max(next_radius - 12.0, 0.0)
-                safe_cubes = [
-                    cube for cube in obs["cubes"]
-                    if math.hypot(
-                        cube["pos"][0] - next_center[0],
-                        cube["pos"][1] - next_center[1],
-                    ) <= safe_radius
-                ]
                 cube = min(
-                    safe_cubes,
+                    obs["cubes"],
                     key=lambda item: (
                         math.dist(item["pos"], me["pos"])
                         + (0 if math.dist(item["pos"], me["pos"]) < self.CUBE_GRAB else 20)
@@ -302,24 +234,6 @@ class Bot:
                     distance = math.hypot(vx, vy) or 1.0
                     action["move"] = [vx / distance * silent, vy / distance * silent]
                     action["aim"] = [math.atan2(vy, vx), 0.0]
-                else:
-                    safe_pickups = [
-                        pickup for pickup in obs["pickups"]
-                        if math.hypot(
-                            pickup["pos"][0] - next_center[0],
-                            pickup["pos"][1] - next_center[1],
-                        ) <= safe_radius
-                        and math.dist(pickup["pos"][:2], (x, y)) < 140
-                    ]
-                    if safe_pickups:
-                        pickup = min(
-                            safe_pickups,
-                            key=lambda item: math.dist(item["pos"], me["pos"]),
-                        )
-                        vx, vy = pickup["pos"][0] - x, pickup["pos"][1] - y
-                        distance = math.hypot(vx, vy) or 1.0
-                        action["move"] = [vx / distance * silent, vy / distance * silent]
-                        action["aim"] = [math.atan2(vy, vx), 0.0]
 
         take = self._take_weapon(me, obs)
         if take:
@@ -328,23 +242,11 @@ class Bot:
         landed_drop = None
         for supply_drop in obs.get("drops", []):
             distance = math.dist(supply_drop["pos"][:2], (x, y))
-            ring_radius = supply_drop.get("radius", 8)
-            contested = any(
-                actor["kind"] == "mech"
-                and actor["id"] != me["id"]
-                and math.dist(actor["pos"][:2], supply_drop["pos"][:2]) < ring_radius
-                for actor in obs["mechs"]
-            )
             if (
                 supply_drop.get("lands_in", 1) <= 0
                 and supply_drop.get("holder") in (None, me["id"])
-                and not contested
-                and target is None
-                and (hp_fraction < 0.85 or me["cubes"] < 6)
-                and math.dist(supply_drop["pos"][:2], next_center) <= next_radius
-                and distance < 140
             ):
-                radius = ring_radius * 0.8
+                radius = supply_drop.get("radius", 8) * 0.8
                 if distance < radius:
                     action["move"] = [0.0, 0.0]
                     action["boost"] = False
