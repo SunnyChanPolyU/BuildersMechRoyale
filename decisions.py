@@ -13,6 +13,64 @@ def safe_point(x, y, next_center, next_radius, zone_margin):
     )
 
 
+def least_populated_point(
+    x,
+    y,
+    next_center,
+    next_radius,
+    known_positions,
+    terrain=None,
+    config=None,
+):
+    """Choose a reachable, in-zone point with the lowest known population."""
+    if next_radius <= 0:
+        return (next_center[0], next_center[1])
+
+    config = config or {}
+    mech_config = config.get("mech", {})
+    max_step = float(mech_config.get("max_step", 1.2))
+    max_slope_deg = float(mech_config.get("max_slope_deg", 50.0))
+    safe_radius = max(next_radius - 12.0, 0.0)
+    candidates = [(next_center[0], next_center[1])]
+    for radius in (safe_radius * 0.45, safe_radius * 0.75, safe_radius):
+        if radius <= 1:
+            continue
+        for i in range(16):
+            angle = i * (2 * math.pi / 16)
+            candidates.append((
+                next_center[0] + radius * math.cos(angle),
+                next_center[1] + radius * math.sin(angle),
+            ))
+
+    best = None
+    best_score = float("inf")
+    for cx, cy in candidates:
+        if math.hypot(cx - next_center[0], cy - next_center[1]) > next_radius - 8.0:
+            continue
+        if terrain is not None:
+            if not terrain.reachable(
+                cx,
+                cy,
+                terrain.ground(x, y),
+                max_step,
+                max_slope_deg,
+            ):
+                continue
+
+        population = 0.0
+        for pos in known_positions:
+            distance = math.hypot(pos[0] - cx, pos[1] - cy)
+            if distance < 120.0:
+                population += 1.0 - (distance / 120.0) * 0.75
+
+        distance_from_bot = math.hypot(cx - x, cy - y)
+        score = population * 100.0 + distance_from_bot * 0.08
+        if score < best_score:
+            best_score = score
+            best = (cx, cy)
+    return best
+
+
 def find_cover(terrain, config, eye_height, x, y, z, threat, next_center, next_radius):
     if terrain is None:
         return None
@@ -92,6 +150,8 @@ def pick_upgrade(obs, config):
                 score += 35.0
         if "sensor" in choice_id or "sensor" in text:
             score += 28.0
+        if any(token in choice_id for token in ("armor", "health", "repair", "regen")):
+            score += 18.0 - hp_fraction * 20.0
         if any(token in choice_id for token in ("speed", "boost", "mobility", "walk")) or "speed" in text:
             score += 24.0
         if any(token in choice_id for token in ("damage", "ammo", "fire", "rate", "reload")) or any(
@@ -145,12 +205,17 @@ def select_target(me, obs, tracked):
     for actor_id, target in tracked.items():
         tx, ty, _ = target["pos"]
         distance = math.hypot(tx - x, ty - y)
-        if distance > 1000:
+        if distance > 320:
             continue
         target_hp = target["hp"] / 1400.0
         score = 90.0 - distance * 0.45
         score += max(0.0, 0.8 - target_hp) * 55.0
         score -= hp_fraction * 8.0
+        age_ticks = int(obs["tick"]) - int(target["seen"])
+        if age_ticks > 20:
+            score -= (age_ticks - 20) * 1.2
+        if age_ticks > 60:
+            continue
         if target["charging"]:
             score -= 25.0
             score += 18.0 if distance < 70 else -10.0
@@ -227,7 +292,7 @@ def movement_direction(me, target, safe_target, obs):
     return [vx / length, vy / length]
 
 
-def choose_state(me, obs, target):
+def choose_state(me, obs, target, nearby_threats=0):
     hp_fraction = me["hp"] / me["max_hp"]
     if not me["in_zone"]:
         return "out_of_zone"
@@ -236,7 +301,11 @@ def choose_state(me, obs, target):
             target["pos"][0] - me["pos"][0],
             target["pos"][1] - me["pos"][1],
         )
-        if hp_fraction < 0.32 or target_distance < 18:
+        if (
+            hp_fraction < 0.32
+            or (hp_fraction < 0.48 and nearby_threats >= 2)
+            or target_distance < 18
+        ):
             return "disengage"
         return "engage"
     if obs["cubes"]:
