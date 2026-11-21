@@ -114,7 +114,7 @@ class TerrainMap:
                 return True
         return False
 
-    def reachable(self, x, y, from_z, max_step=1.2, max_slope_deg=50.0):
+    def reachable(self, x, y, from_z, max_step=1.2, max_slope_deg=65.0):
         """Conservative local reachability check for cover/loot points."""
         b = self.bounds
         if not (b["minX"] < x < b["maxX"] and b["minY"] < y < b["maxY"]):
@@ -137,7 +137,7 @@ class TerrainMap:
 class Bot:
     name = "ver-5-bot"
 
-    PANIC_DIST = 100.0   # flee if a mech is visible closer than this
+    PANIC_DIST = 150.0   # flee if a mech is visible closer than this
     FIGHT_DIST = 60.0    # engage when pressed closer than this
     CUBE_GRAB = 25.0     # grab cubes within this range while calm
     ZONE_MARGIN = 40.0   # preferred inset from the next circle's edge
@@ -157,15 +157,17 @@ class Bot:
         self.last_damage_tick = -1000
         self.last_hit_tick = -1000
         self.previous_hp = None
+        self.damage_history = []
         self.last_state = "explore"
+        self._population_grid_candidates = None
         self.match_seed = int(hello.get("seed", 0))
         self.map = None
         try:
             self.map = TerrainMap(hello["map"]["dir"],
                                   hello["map"].get("files", []))
-            mf.log(f"ver-4-bot: map loaded, {len(self.map.prisms)} prisms")
+            mf.log(f"{self.name}: map loaded, {len(self.map.prisms)} prisms")
         except Exception as e:  # any failure: degrade, never crash
-            mf.log(f"ver-4-bot: no map ({e!r}); fallback navigation mode")
+            mf.log(f"{self.name}: no map ({e!r}); fallback navigation mode")
         self.cover_goal = None
         self.next_cover_scan = 0
 
@@ -186,7 +188,10 @@ class Bot:
         inside the next circle. Returns (x, y) or None."""
         if self.map is None:
             return None
-        tx, ty, tz = threat["pos"]
+        if isinstance(threat, dict) and "pos" in threat:
+            threats = [threat]
+        else:
+            threats = list(threat)
         b = self.map.bounds
         best, best_cost = None, float("inf")
         for i in range(24):
@@ -202,16 +207,63 @@ class Bot:
                 if not self.map.reachable(
                         cx, cy, z,
                         float(mech_cfg.get("max_step", 1.2)),
-                        float(mech_cfg.get("max_slope_deg", 50.0))):
+                        max(float(mech_cfg.get("max_slope_deg", 50.0)), 65.0)):
                     continue
                 cz = self.map.ground(cx, cy) + self.eye
-                if not self.map.blocked(tx, ty, tz + self.eye, cx, cy, cz):
+                blocked_count = 0
+                proximity = 0.0
+                for threat_mech in threats:
+                    tx, ty, tz = threat_mech["pos"]
+                    td = math.hypot(cx - tx, cy - ty)
+                    proximity += max(0.0, 160.0 - td)
+                    if self.map.blocked(tx, ty, tz + self.eye, cx, cy, cz):
+                        blocked_count += 1
+                if not threats or blocked_count == 0:
                     continue
-                cost = (math.hypot(cx - x, cy - y) * 0.6
-                        + math.hypot(cx - tx, cy - ty) * 0.4)
+                cost = (math.hypot(cx - x, cy - y) * 0.35
+                        - blocked_count * 100.0
+                        - proximity * 0.08)
                 if cost < best_cost:
                     best, best_cost = (cx, cy), cost
         return best
+
+    def _fallback_escape_direction(self, me, threats):
+        """Choose a nearby reachable heading that loses the most threats."""
+        x, y, z = me["pos"]
+        best_direction = None
+        best_score = float("-inf")
+        for i in range(16):
+            ang = i * (2 * math.pi / 16)
+            cx = x + 30.0 * math.cos(ang)
+            cy = y + 30.0 * math.sin(ang)
+            if self.map is not None:
+                mech_cfg = self.cfg.get("mech", {})
+                if not self.map.reachable(
+                        cx, cy, z,
+                        float(mech_cfg.get("max_step", 1.2)),
+                        max(float(mech_cfg.get("max_slope_deg", 50.0)), 65.0)):
+                    continue
+            visible = 0
+            weighted_distance = 0.0
+            for threat in threats:
+                tx, ty, tz = threat["pos"]
+                if self.map is not None:
+                    cz = self.map.ground(cx, cy) + self.eye
+                    if not self.map.blocked(tx, ty, tz + self.eye, cx, cy, cz):
+                        visible += 1
+                        weighted_distance += math.hypot(cx - tx, cy - ty)
+            score = -visible * 100.0 + weighted_distance * 0.05
+            if threats and score > best_score:
+                best_score = score
+                best_direction = [math.cos(ang), math.sin(ang)]
+        if best_direction is not None:
+            return best_direction
+        if threats:
+            tx, ty, _ = threats[0]["pos"]
+            dx, dy = x - tx, y - ty
+            d = math.hypot(dx, dy) or 1.0
+            return [dx / d, dy / d]
+        return None
 
     def _silent_factor(self, me):
         walk = float(me["stats"].get("walk_speed", 11.7))
@@ -235,15 +287,21 @@ class Bot:
 
         if self.map is not None:
             b = self.map.bounds
-            step = 50.0
-            cx = b["minX"]
-            while cx < b["maxX"]:
-                cy = b["minY"]
-                while cy < b["maxY"]:
-                    if math.hypot(cx - nxt[0], cy - nxt[1]) <= nr - 10.0:
-                        candidates.append((cx, cy))
-                    cy += step
-                cx += step
+            if self._population_grid_candidates is None:
+                grid = []
+                step = 50.0
+                cx = b["minX"]
+                while cx < b["maxX"]:
+                    cy = b["minY"]
+                    while cy < b["maxY"]:
+                        grid.append((cx, cy))
+                        cy += step
+                    cx += step
+                self._population_grid_candidates = grid
+            candidates.extend(
+                point for point in self._population_grid_candidates
+                if math.hypot(point[0] - nxt[0], point[1] - nxt[1]) <= nr - 10.0
+            )
 
         if not candidates:
             return (nxt[0], nxt[1])
@@ -256,7 +314,7 @@ class Bot:
                 if not self.map.reachable(
                         cx, cy, z,
                         float(mech_cfg.get("max_step", 1.2)),
-                        float(mech_cfg.get("max_slope_deg", 50.0))):
+                        max(float(mech_cfg.get("max_slope_deg", 50.0)), 65.0)):
                     continue
 
             nearby = 0
@@ -395,6 +453,36 @@ class Bot:
         if not target:
             return aim, fire, reload
         x, y, z = me["pos"]
+        candidates = [target]
+        candidates.extend(
+            {
+                "pos": list(tracked["pos"]),
+                "vel": list(tracked["vel"]),
+                "weapons": list(tracked["weapons"]),
+                "charging": tracked["charging"],
+                "hp": tracked["hp"],
+                "id": actor_id,
+            }
+            for actor_id, tracked in sorted(
+                self.tracked_mechs.items(),
+                key=lambda pair: math.hypot(
+                    pair[1]["pos"][0] - x,
+                    pair[1]["pos"][1] - y,
+                ),
+            )
+            if actor_id != target.get("id")
+        )
+        for candidate in candidates:
+            candidate_dist = math.dist(me["pos"], candidate["pos"])
+            candidate_blocked = False
+            if self.map is not None:
+                candidate_blocked = self.map.blocked(
+                    x, y, z + float(me["stats"].get("eye_height", self.eye)),
+                    candidate["pos"][0], candidate["pos"][1],
+                    candidate["pos"][2] + 4.5)
+            if not candidate_blocked and candidate_dist <= 230:
+                target = candidate
+                break
         d = math.dist(me["pos"], target["pos"])
         blocked = False
         if self.map is not None:
@@ -439,8 +527,11 @@ class Bot:
     def _update_tracking(self, obs):
         tick = int(obs["tick"])
         memory_s = float(self.cfg.get("vision", {}).get("memory_s", 5.0))
+        me = obs["self"]
         for actor in obs["mechs"]:
             if actor["kind"] != "mech":
+                continue
+            if actor["id"] == me["id"]:
                 continue
             self.tracked_mechs[actor["id"]] = {
                 "pos": list(actor["pos"]),
@@ -468,7 +559,7 @@ class Bot:
             if d > 1000:
                 continue
             target_hp = target["hp"] / 1400.0
-            score = 90.0 - d * 0.45
+            score = 130.0 - d * 0.70
             score += max(0.0, 0.8 - target_hp) * 55.0
             score -= hp_frac * 8.0
             if target["charging"]:
@@ -554,6 +645,14 @@ class Bot:
 
         if self.previous_hp is not None and me["hp"] < self.previous_hp:
             self.last_damage_tick = int(obs["tick"])
+            lost = float(self.previous_hp - me["hp"])
+            self.damage_history.append((int(obs["tick"]), lost))
+        cutoff_tick = int(obs["tick"]) - 30
+        self.damage_history = [
+            (tick, lost) for tick, lost in self.damage_history
+            if tick >= cutoff_tick
+        ]
+        recent_damage = sum(lost for tick, lost in self.damage_history)
         for event in reversed(obs.get("events", [])):
             if event.get("type") == "hit":
                 self.last_hit_tick = int(obs["tick"])
@@ -590,7 +689,8 @@ class Bot:
             state = "out_of_zone"
         elif target is not None:
             target_dist = math.hypot(target["pos"][0] - x, target["pos"][1] - y)
-            if hp_frac < 0.32 or target_dist < 18:
+            heavy_damage = recent_damage >= 120.0
+            if hp_frac < 0.32 or target_dist < 18 or heavy_damage or threats:
                 state = "disengage"
             else:
                 state = "engage"
@@ -616,22 +716,41 @@ class Bot:
             if reload:
                 act["reload"] = True
             energy = float(me["energy"])
-            act["boost"] = bool(me["grounded"] and energy > 25
+            act["boost"] = bool(me["grounded"] and energy > 5
                                 and state == "disengage")
-            if state == "disengage" and target:
-                target_pos = target["pos"]
+            if state == "disengage":
                 replan = (self.cover_goal is None
                           or obs["tick"] >= self.next_cover_scan
                           or math.hypot(self.cover_goal[0] - x,
                                         self.cover_goal[1] - y) < 8)
                 if replan:
-                    threat = {"pos": target_pos}
-                    self.cover_goal = self._find_cover(x, y, z, threat, nxt, nr)
+                    threat_list = [
+                        {"pos": tracked["pos"]}
+                        for tracked in sorted(
+                            (item for item in self.tracked_mechs.values()
+                             if math.hypot(item["pos"][0] - x,
+                                           item["pos"][1] - y) < self.PANIC_DIST),
+                            key=lambda item: math.hypot(
+                                item["pos"][0] - x, item["pos"][1] - y),
+                        )
+                    ]
+                    if not threat_list and target:
+                        threat_list = [{"pos": target["pos"]}]
+                    self.cover_goal = self._find_cover(
+                        x, y, z, threat_list, nxt, nr)
                     self.next_cover_scan = obs["tick"] + self.COVER_CHECK
                 if self.cover_goal:
                     dx, dy = self.cover_goal[0] - x, self.cover_goal[1] - y
                     dl = math.hypot(dx, dy) or 1.0
                     act["move"] = [dx / dl, dy / dl]
+                else:
+                    fallback = self._fallback_escape_direction(
+                        me,
+                        [{"pos": tracked["pos"]}
+                         for tracked in self.tracked_mechs.values()],
+                    )
+                    if fallback:
+                        act["move"] = fallback
             if me["grounded"] and energy > 35:
                 act["jump"] = bool(obs["tick"] % 30 == 0 and target
                                    and math.hypot(target["pos"][0] - x,
@@ -700,4 +819,5 @@ class Bot:
         return act
 
 
-mf.run(Bot)
+if __name__ == "__main__":
+    mf.run(Bot)
